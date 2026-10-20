@@ -1,12 +1,14 @@
 import os
 
 import streamlit as st
-from azure.ai.projects import AIProjectClient
-from azure.identity import DefaultAzureCredential
+from azure.identity import DefaultAzureCredential, get_bearer_token_provider
 from dotenv import load_dotenv
+from openai import OpenAI
 
 # Loads .env for local runs; in Azure Container Apps the values come from app settings.
 load_dotenv()
+
+FOUNDRY_SCOPE = "https://ai.azure.com/.default"
 
 
 def get_project_endpoint():
@@ -40,72 +42,49 @@ def get_project_endpoint():
     return combined
 
 
-def get_project_client():
-    endpoint = get_project_endpoint()
-    return AIProjectClient(
-        endpoint=endpoint,
-        credential=DefaultAzureCredential(),
-    )
-
-
-def get_assistant_reply(project_client, thread_id, agent_id, message_text):
-    project_client.agents.messages.create(
-        thread_id=thread_id,
-        role="user",
-        content=message_text,
-    )
-
-    run = project_client.agents.runs.create_and_process(
-        thread_id=thread_id,
-        agent_id=agent_id,
-    )
-
-    if getattr(run, "status", None) == "failed":
-        raise RuntimeError(f"Agent run failed: {getattr(run, 'last_error', 'unknown error')}")
-
-    messages = list(project_client.agents.messages.list(thread_id=thread_id, order="desc", limit=20))
-
-    for message in messages:
-        if getattr(message, "role", None) == "assistant":
-            for item in getattr(message, "content", []):
-                text_value = getattr(getattr(item, "text", None), "value", None)
-                if text_value:
-                    return text_value
-
-    return "The agent did not return any text for that message."
-
-
-AGENT_INSTRUCTIONS = (
-    "You are a helpful assistant. Keep replies concise but informative. "
-    "Answer clearly and use markdown when useful."
-)
+def get_agent_name():
+    agent_name = os.getenv("FOUNDRY_AGENT_ID") or os.getenv("AGENT_NAME")
+    if not agent_name:
+        raise ValueError(
+            "FOUNDRY_AGENT_ID environment variable is not set. "
+            "Set it to the name of the Foundry agent, for example 'streamlit-agent-new-version'."
+        )
+    return agent_name
 
 
 @st.cache_resource
-def get_or_create_agent():
-    project_client = get_project_client()
-    agent_name = os.getenv("AGENT_NAME", "azure-container-app-agent")
+def get_agent_session():
+    endpoint = get_project_endpoint()
+    agent_name = get_agent_name()
 
-    # Reuse an explicitly configured agent so restarts and scale-out don't create duplicates.
-    agent_id = os.getenv("FOUNDRY_AGENT_ID")
-    if agent_id:
-        return project_client, project_client.agents.get_agent(agent_id)
+    # The Foundry agent speaks the OpenAI-compatible Responses protocol, served under /openai/v1.
+    token_provider = get_bearer_token_provider(DefaultAzureCredential(), FOUNDRY_SCOPE)
+    client = OpenAI(base_url=f"{endpoint}/openai/v1", api_key=token_provider())
+    return client, token_provider, agent_name
 
-    # Fall back to reusing an agent already created under the same name.
-    for existing in project_client.agents.list_agents():
-        if getattr(existing, "name", None) == agent_name:
-            return project_client, existing
 
-    model_deployment = os.getenv("MODEL_DEPLOYMENT_NAME")
-    if not model_deployment:
-        raise ValueError("MODEL_DEPLOYMENT_NAME environment variable is not set.")
+def get_agent_reply(client, token_provider, agent_name, message_text, previous_response_id=None):
+    # The credential caches tokens, so this only performs a refresh near expiry.
+    client.api_key = token_provider()
 
-    agent = project_client.agents.create_agent(
-        model=model_deployment,
-        name=agent_name,
-        instructions=AGENT_INSTRUCTIONS,
-    )
-    return project_client, agent
+    request = {
+        "input": message_text,
+        "extra_body": {
+            "agent_reference": {"type": "agent_reference", "name": agent_name}
+        },
+    }
+    if previous_response_id:
+        request["previous_response_id"] = previous_response_id
+
+    response = client.responses.create(**request)
+
+    if getattr(response, "status", None) == "failed":
+        raise RuntimeError(f"Agent run failed: {getattr(response, 'error', 'unknown error')}")
+
+    reply = (response.output_text or "").strip()
+    if not reply:
+        reply = "The agent did not return any text for that message."
+    return response.id, reply
 
 
 if st.runtime.exists():
@@ -116,27 +95,24 @@ if st.runtime.exists():
 
     if "messages" not in st.session_state:
         st.session_state.messages = []
+        st.session_state.previous_response_id = None
 
-    if "thread_id" not in st.session_state:
-        try:
-            project_client, agent = get_or_create_agent()
-            thread = project_client.agents.threads.create()
-            st.session_state.project_client = project_client
-            st.session_state.agent = agent
-            st.session_state.thread_id = thread.id
-        except Exception as exc:
-            st.error(
-                "The app could not initialize the Azure Foundry agent. Check your environment variables and Azure login. "
-                f"Details: {exc}"
-            )
-            st.stop()
+    try:
+        client, token_provider, agent_name = get_agent_session()
+    except Exception as exc:
+        st.error(
+            "The app could not initialize the Azure Foundry agent. Check your environment variables and Azure login. "
+            f"Details: {exc}"
+        )
+        st.stop()
 
     with st.sidebar:
         st.header("Settings")
-        st.write(f"Agent: {st.session_state.agent.name}")
-        st.write(f"Thread: {st.session_state.thread_id}")
+        st.write(f"Agent: {agent_name}")
+        st.write(f"Last response: {st.session_state.previous_response_id or '-'}")
         if st.button("Clear chat"):
             st.session_state.messages = []
+            st.session_state.previous_response_id = None
             st.rerun()
 
     for message in st.session_state.messages:
@@ -151,12 +127,14 @@ if st.runtime.exists():
         with st.chat_message("assistant"):
             with st.spinner("Thinking..."):
                 try:
-                    reply = get_assistant_reply(
-                        st.session_state.project_client,
-                        st.session_state.thread_id,
-                        st.session_state.agent.id,
+                    response_id, reply = get_agent_reply(
+                        client,
+                        token_provider,
+                        agent_name,
                         prompt,
+                        st.session_state.previous_response_id,
                     )
+                    st.session_state.previous_response_id = response_id
                     st.markdown(reply)
                     st.session_state.messages.append({"role": "assistant", "content": reply})
                 except Exception as exc:

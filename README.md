@@ -1,18 +1,27 @@
 # Azure Container Apps + Streamlit + Foundry Agent
 
-This sample creates a simple Streamlit app that talks to an Azure AI Foundry agent. It is designed to be deployed to Azure Container Apps.
+A simple Streamlit chat app that talks to an Azure AI Foundry agent, designed to run in Azure Container Apps.
+
+The app calls the agent through the **Responses API**, which is the protocol used by agents
+created in the current Foundry portal. The agent is referenced by name, and conversation
+history is carried with `previous_response_id`.
 
 ## Prerequisites
 
 - Azure subscription
 - Azure AI Foundry project
-- Azure AI model deployment (for example `gpt-4o-mini`)
+- An agent created in the Foundry portal
 - Azure CLI installed and logged in
-- Docker installed if you want to build locally
 
 ## Local setup
 
-1. Create a virtual environment and install dependencies:
+1. Install dependencies into the project virtual environment:
+
+   ```bash
+   uv pip install --python .venv\Scripts\python.exe -r requirements.txt
+   ```
+
+   The bundled `.venv` is uv-managed and has no `pip`. If you prefer a standard venv:
 
    ```bash
    python -m venv .venv
@@ -26,48 +35,67 @@ This sample creates a simple Streamlit app that talks to an Azure AI Foundry age
    copy .env.example .env
    ```
 
-3. Run the app locally:
+3. Run the app:
 
    ```bash
    streamlit run app.py
    ```
 
+## Configuration
+
+| Variable | Required | Description |
+| --- | --- | --- |
+| `PROJECT_ENDPOINT` | Yes | Foundry project endpoint, ending in `/api/projects/<project-name>` |
+| `FOUNDRY_AGENT_ID` | Yes | Name of the agent. For portal-created agents the name is also the ID |
+| `AGENT_NAME` | No | Fallback used only when `FOUNDRY_AGENT_ID` is not set |
+| `PROJECT_CONNECTION_STRING` | No | Alternative to `PROJECT_ENDPOINT` |
+
+The app never creates an agent. It only talks to the agent you configure, so container
+restarts and scale-out events cannot produce duplicates.
+
+### Finding your agent name
+
+```bash
+az rest --method get \
+  --url "<PROJECT_ENDPOINT>/agents?api-version=v1" \
+  --resource "https://ai.azure.com"
+```
+
+The `id` field of each entry is the value to use for `FOUNDRY_AGENT_ID`.
+
 ## Azure Container Apps deployment
 
-1. Build the container image and push it to Azure Container Registry (ACR):
+1. Build and push the image, or deploy from a Git repository:
 
    ```bash
    az acr build --registry <acr-name> --image foundry-streamlit-app:latest .
    ```
 
-2. Create a Container App using the built image.
+2. Create the Container App from that image.
 
-3. Set the following environment variables in the Container App:
+3. Add the environment variables from the table above under
+   **Application → Containers → Edit → Environment variables**.
 
-   - `PROJECT_ENDPOINT` (preferred) or `PROJECT_CONNECTION_STRING`
-   - `MODEL_DEPLOYMENT_NAME`
-   - `AGENT_NAME`
-   - `FOUNDRY_AGENT_ID` (recommended)
+4. Enable a system-assigned managed identity under **Identity**.
 
-   Set `FOUNDRY_AGENT_ID` to an existing agent so container restarts and scale-out events
-   reuse that agent instead of creating a new one each time. If it is not set, the app
-   reuses the first agent matching `AGENT_NAME`, and only creates an agent if none exists.
+5. Grant that identity access to the Foundry resource under **Access control (IAM)**.
+   Assign **Foundry Agent Consumer** for least privilege, or **Foundry User** if the
+   former is unavailable. Do not use **Azure AI Developer**, which applies to
+   Azure Machine Learning workspaces and Foundry hubs rather than Foundry projects.
 
-   List your agents to find the ID:
+6. Under **Ingress**, set the target port to match the port the app actually listens on
+   (`8501` when started with the command below) and enable external ingress.
 
-   ```python
-   for a in project_client.agents.list_agents():
-       print(a.id, a.name, a.model)
+   ```bash
+   streamlit run app.py --server.address=0.0.0.0 --server.port=8501 --server.headless=true
    ```
-
-4. Grant the Container App managed identity access to the Azure AI Foundry project.
-
-   Example role assignments include Azure AI Developer or the relevant project permissions for the model and agent endpoint.
-
-5. In the Azure Portal, configure the container port as `8501`.
 
 ## Notes
 
-- `DefaultAzureCredential` is used for authentication.
-- In Azure Container Apps, attach a managed identity and grant it access to your Azure AI Foundry project.
-- This sample is intentionally simple and can be used as a starting point for a production-grade agent chat app.
+- Authentication uses `DefaultAzureCredential` with the `https://ai.azure.com/.default`
+  scope. Locally this is your Azure CLI login; in Container Apps it is the managed identity.
+- Conversation history lives in Streamlit session state, so it is lost if a user's session
+  moves to another replica or the container restarts. Persist `previous_response_id`
+  externally if durable history is needed.
+- Any tools enabled on the agent, such as web search, work automatically. No app change is
+  required to add or remove them.
