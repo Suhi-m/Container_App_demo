@@ -10,7 +10,7 @@ history is carried with `previous_response_id`.
 
 - Azure subscription
 - Azure AI Foundry project
-- An agent created in the Foundry portal
+- A model deployed in the Foundry project (only used if the app has to create the agent)
 - Azure CLI installed and logged in
 
 ## Local setup
@@ -47,11 +47,15 @@ history is carried with `previous_response_id`.
 | --- | --- | --- |
 | `PROJECT_ENDPOINT` | Yes | Foundry project endpoint, ending in `/api/projects/<project-name>` |
 | `FOUNDRY_AGENT_ID` | Yes | Name of the agent. For portal-created agents the name is also the ID |
+| `FOUNDRY_MODEL_NAME` | Only if the agent does not exist | Model deployment name used to create the agent |
+| `AGENT_INSTRUCTIONS` | No | Instructions for an agent the app creates. Defaults to a general assistant prompt |
 | `AGENT_NAME` | No | Fallback used only when `FOUNDRY_AGENT_ID` is not set |
 | `PROJECT_CONNECTION_STRING` | No | Alternative to `PROJECT_ENDPOINT` |
 
-The app never creates an agent. It only talks to the agent you configure, so container
-restarts and scale-out events cannot produce duplicates.
+On startup the app looks up the agent by name. If it exists it is used unchanged; if it
+does not, the app creates it from `FOUNDRY_MODEL_NAME` and `AGENT_INSTRUCTIONS`. An existing
+agent is never modified. Creating an agent needs more than invoke access, so the identity
+must be allowed to write agents in the project.
 
 ### Finding your agent name
 

@@ -1,6 +1,9 @@
 import os
 
 import streamlit as st
+from azure.ai.projects import AIProjectClient
+from azure.ai.projects.models import PromptAgentDefinition
+from azure.core.exceptions import ResourceNotFoundError
 from azure.identity import DefaultAzureCredential, get_bearer_token_provider
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -9,6 +12,7 @@ from openai import OpenAI
 load_dotenv()
 
 FOUNDRY_SCOPE = "https://ai.azure.com/.default"
+DEFAULT_AGENT_INSTRUCTIONS = "You are a helpful assistant. Keep replies concise but informative. Answer clearly and use markdown when useful. Short responses are preferred."
 
 
 def get_project_endpoint():
@@ -52,13 +56,39 @@ def get_agent_name():
     return agent_name
 
 
+def ensure_agent_exists(endpoint, credential, agent_name):
+    """Create the agent if the project has none with this name; otherwise leave it untouched."""
+    with AIProjectClient(endpoint=endpoint, credential=credential) as project:
+        try:
+            project.agents.get(agent_name=agent_name)
+            return
+        except ResourceNotFoundError:
+            pass
+
+        model = os.getenv("FOUNDRY_MODEL_NAME")
+        if not model:
+            raise ValueError(
+                f"Agent '{agent_name}' does not exist and FOUNDRY_MODEL_NAME is not set. "
+                "Set it to a model deployment name so the agent can be created."
+            )
+        project.agents.create_version(
+            agent_name=agent_name,
+            definition=PromptAgentDefinition(
+                model=model,
+                instructions=os.getenv("AGENT_INSTRUCTIONS") or DEFAULT_AGENT_INSTRUCTIONS,
+            ),
+        )
+
+
 @st.cache_resource
 def get_agent_session():
     endpoint = get_project_endpoint()
     agent_name = get_agent_name()
+    credential = DefaultAzureCredential()
+    ensure_agent_exists(endpoint, credential, agent_name)
 
     # The Foundry agent speaks the OpenAI-compatible Responses protocol, served under /openai/v1.
-    token_provider = get_bearer_token_provider(DefaultAzureCredential(), FOUNDRY_SCOPE)
+    token_provider = get_bearer_token_provider(credential, FOUNDRY_SCOPE)
     client = OpenAI(base_url=f"{endpoint}/openai/v1", api_key=token_provider())
     return client, token_provider, agent_name
 
